@@ -92,6 +92,9 @@ function broadcastBookingChange(booking, action = 'updated') {
   void deliverBookingNotification(booking, action).catch((error) => {
     console.error('Failed to deliver booking notification:', error.message);
   });
+  void deliverPilotBookingNotification(booking, action).catch((error) => {
+    console.error('Failed to deliver pilot booking notification:', error.message);
+  });
 }
 
 function escapeHtml(value) {
@@ -129,6 +132,83 @@ async function deliverBookingNotification(booking, action) {
     </ul>
     <p><a href="${frontendUrl}/${booking.agent_id ? 'agent' : 'admin?tab=schedule'}">Abrir painel de reservas</a></p>`;
   await sendEmail(recipient, subject, html, booking.id);
+}
+
+async function deliverPilotBookingNotification(booking, action) {
+  if (!booking?.id || !booking?.provider_id) return;
+
+  const [pilotResult, bookingResult] = await Promise.all([
+    pool.query(
+      `SELECT p.name,p.phone,u.email
+       FROM profiles p LEFT JOIN platform_users u ON u.id=p.id
+       WHERE p.id=$1 AND p.role IN ('pilot','provider','aluno','student')`,
+      [booking.provider_id],
+    ),
+    pool.query(
+      `SELECT b.booking_code,b.booking_date,b.booking_time,b.status,b.total_price,
+              COALESCE(b.client_details->>'name',client.name,'Cliente') AS client_name,
+              location.name AS location_name,activity.name AS activity_name
+       FROM bookings b
+       LEFT JOIN profiles client ON client.id=b.client_id
+       LEFT JOIN flight_zones location ON location.id=b.location_id
+       LEFT JOIN activities activity ON activity.id=b.activity_id
+       WHERE b.id=$1`,
+      [booking.id],
+    ),
+  ]);
+
+  const pilot = pilotResult.rows[0];
+  if (!pilot) return;
+  const details = { ...booking, ...(bookingResult.rows[0] || {}) };
+  const email = pilot.email?.endsWith('@whatsapp.parapenteangola.invalid') ? '' : String(pilot.email || '').trim();
+  const phone = normalizePhone(pilot.phone);
+  const actionLabel = action === 'created' ? 'Nova reserva atribuída' : action === 'deleted' ? 'Reserva eliminada' : 'Reserva atribuída/alterada';
+  const bookingCode = details.booking_code || booking.id.slice(0, 8).toUpperCase();
+  const clientName = details.client_name || details.client_details?.name || 'Cliente';
+  const activityName = details.activity_name || 'Atividade';
+  const locationName = details.location_name || 'Local a confirmar';
+  const dateAndTime = `${details.booking_date || 'Data a confirmar'} ${details.booking_time || ''}`.trim();
+  const totalPrice = Number(details.total_price || 0);
+  const amountLabel = totalPrice > 0 ? `${totalPrice.toLocaleString('pt-PT')} AOA` : 'A confirmar';
+  const pilotUrl = `${frontendUrl}/pilot`;
+
+  const deliveries = [];
+  if (/^2449\d{8}$/.test(phone)) {
+    deliveries.push(sendWhatsApp(phone, [
+      `Olá ${pilot.name || 'Piloto'},`,
+      `${actionLabel}: ${bookingCode}`,
+      `Cliente: ${clientName}`,
+      `Atividade: ${activityName}`,
+      `Local: ${locationName}`,
+      `Data: ${dateAndTime}`,
+      `Estado: ${details.status || '—'}`,
+      `Valor: ${amountLabel}`,
+      `Consultar: ${pilotUrl}`,
+    ].join('\n')));
+  }
+  if (/^\S+@\S+\.\S+$/.test(email)) {
+    const subject = `${actionLabel} ${bookingCode} — Parapente Angola`;
+    const html = `<p>Olá ${escapeHtml(pilot.name || 'Piloto')},</p>
+      <p><strong>${escapeHtml(actionLabel)}</strong>.</p>
+      <ul>
+        <li><strong>Reserva:</strong> ${escapeHtml(bookingCode)}</li>
+        <li><strong>Cliente:</strong> ${escapeHtml(clientName)}</li>
+        <li><strong>Atividade:</strong> ${escapeHtml(activityName)}</li>
+        <li><strong>Local:</strong> ${escapeHtml(locationName)}</li>
+        <li><strong>Data:</strong> ${escapeHtml(dateAndTime)}</li>
+        <li><strong>Estado:</strong> ${escapeHtml(details.status || '—')}</li>
+        <li><strong>Valor:</strong> ${escapeHtml(amountLabel)}</li>
+      </ul>
+      <p><a href="${pilotUrl}">Abrir painel do piloto</a></p>`;
+    deliveries.push(sendEmail(email, subject, html, booking.id));
+  }
+
+  const results = await Promise.allSettled(deliveries);
+  const failures = results.filter((result) => result.status === 'rejected');
+  for (const failure of failures) console.error('Pilot notification channel failed:', failure.reason?.message || failure.reason);
+  if (deliveries.length && failures.length === deliveries.length) {
+    throw new Error('All configured pilot notification channels failed');
+  }
 }
 
 async function streamBookingEvents(req, res, headers) {
