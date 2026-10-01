@@ -16,6 +16,7 @@ const postgrestUrl = process.env.POSTGREST_URL || 'http://postgrest:3000';
 const smtpEndpoint = process.env.SMTP_ENDPOINT || '';
 const whatsappEndpoint = process.env.WHATSAPP_ENDPOINT || 'https://cacimboerp.cacimboweb.com/api/send-message-whatsapp';
 const frontendUrl = (process.env.FRONTEND_URL || 'https://www.parapenteangola.com').replace(/\/+$/, '');
+const platformNotificationEmail = process.env.ADMIN_NOTIFICATION_EMAIL || 'info@parapenteangola.com';
 const accessTokenTtlSeconds = Math.min(Math.max(Number(process.env.ACCESS_TOKEN_TTL_SECONDS || 14400), 900), 86400);
 const allowedOrigins = new Set((process.env.CORS_ORIGINS || '')
   .split(',').map((item) => item.trim()).filter(Boolean));
@@ -87,6 +88,46 @@ function broadcastBookingChange(booking, action = 'updated') {
     try { client.res.write(data); }
     catch { bookingEventClients.delete(client); }
   }
+  void deliverBookingNotification(booking, action).catch((error) => {
+    console.error('Failed to deliver booking notification:', error.message);
+  });
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;').replaceAll("'", '&#039;');
+}
+
+async function deliverBookingNotification(booking, action) {
+  if (!booking?.id) return;
+  let recipient = platformNotificationEmail;
+  let recipientName = 'Parapente Angola';
+  if (booking.agent_id) {
+    const result = await pool.query(
+      `SELECT p.name,p.company_name,p.company_email,u.email
+       FROM profiles p LEFT JOIN platform_users u ON u.id=p.id WHERE p.id=$1`,
+      [booking.agent_id],
+    );
+    const agent = result.rows[0];
+    recipient = agent?.company_email || (agent?.email?.endsWith('@whatsapp.parapenteangola.invalid') ? '' : agent?.email) || '';
+    recipientName = agent?.company_name || agent?.name || 'Agente';
+  }
+  if (!recipient) return;
+  const actionLabel = action === 'created' ? 'Nova reserva' : action === 'deleted' ? 'Reserva eliminada' : 'Reserva alterada';
+  const clientName = booking.client_details?.name || 'Cliente';
+  const bookingCode = booking.booking_code || booking.id.slice(0, 8);
+  const subject = `${actionLabel} ${bookingCode} — Parapente Angola`;
+  const html = `<p>Olá ${escapeHtml(recipientName)},</p>
+    <p><strong>${escapeHtml(actionLabel)}</strong> na plataforma.</p>
+    <ul>
+      <li><strong>Reserva:</strong> ${escapeHtml(bookingCode)}</li>
+      <li><strong>Cliente:</strong> ${escapeHtml(clientName)}</li>
+      <li><strong>Data:</strong> ${escapeHtml(booking.booking_date || '—')} ${escapeHtml(booking.booking_time || '')}</li>
+      <li><strong>Estado:</strong> ${escapeHtml(booking.status || '—')}</li>
+    </ul>
+    <p><a href="${frontendUrl}/${booking.agent_id ? 'agent' : 'admin?tab=schedule'}">Abrir painel de reservas</a></p>`;
+  await sendEmail(recipient, subject, html, booking.id);
 }
 
 async function streamBookingEvents(req, res, headers) {
