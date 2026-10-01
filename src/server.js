@@ -20,6 +20,7 @@ const accessTokenTtlSeconds = Math.min(Math.max(Number(process.env.ACCESS_TOKEN_
 const allowedOrigins = new Set((process.env.CORS_ORIGINS || '')
   .split(',').map((item) => item.trim()).filter(Boolean));
 const pool = new Pool({ connectionString: databaseUrl, max: 10 });
+const bookingEventClients = new Set();
 
 const publicReadTables = new Set([
   'activities', 'equipment_types', 'extras', 'flight_zones', 'gallery_images',
@@ -63,6 +64,53 @@ function send(res, status, payload, headers = {}) {
   const body = payload === undefined ? '' : JSON.stringify(payload);
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', ...headers });
   res.end(body);
+}
+
+function bookingEventPayload(booking, action = 'updated') {
+  return {
+    type: 'booking.changed',
+    action,
+    booking_id: booking?.id || null,
+    agent_id: booking?.agent_id || null,
+    status: booking?.status || null,
+    occurred_at: new Date().toISOString(),
+  };
+}
+
+function broadcastBookingChange(booking, action = 'updated') {
+  const event = bookingEventPayload(booking, action);
+  const data = `event: booking\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const client of bookingEventClients) {
+    const canReceive = client.role === 'admin'
+      || (client.role === 'agent' && event.agent_id === client.userId);
+    if (!canReceive) continue;
+    try { client.res.write(data); }
+    catch { bookingEventClients.delete(client); }
+  }
+}
+
+async function streamBookingEvents(req, res, headers) {
+  const auth = await authenticate(req);
+  if (!['admin', 'agent'].includes(auth.role)) {
+    return send(res, 403, { message: 'Operação não autorizada.' }, headers);
+  }
+  res.writeHead(200, {
+    ...headers,
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.write(`event: ready\ndata: ${JSON.stringify({ connected: true })}\n\n`);
+  const client = { res, role: auth.role, userId: auth.sub };
+  bookingEventClients.add(client);
+  const keepAlive = setInterval(() => {
+    try { res.write(': keep-alive\n\n'); }
+    catch { clearInterval(keepAlive); bookingEventClients.delete(client); }
+  }, 20_000);
+  const cleanup = () => { clearInterval(keepAlive); bookingEventClients.delete(client); };
+  req.on('close', cleanup);
+  req.on('error', cleanup);
 }
 
 async function jsonBody(req, limit = 2_000_000) {
@@ -135,7 +183,11 @@ async function signUp(req, res, headers) {
   }
   const existing = channel === 'email'
     ? await pool.query('SELECT 1 FROM platform_users WHERE lower(email)=lower($1)', [email])
-    : await pool.query("SELECT 1 FROM profiles WHERE regexp_replace(COALESCE(phone,''),'\\D','','g')=$1", [phone]);
+    : await pool.query(
+      `SELECT 1 FROM profiles
+       WHERE right(regexp_replace(COALESCE(phone,''),'\\D','','g'),9)=right($1,9)`,
+      [phone],
+    );
   if (existing.rowCount) return send(res, 409, { message: 'Já existe uma conta com este contacto.' }, headers);
 
   const recent = await pool.query(
@@ -524,6 +576,7 @@ async function updatePilotBookingStatus(req, res, headers, bookingId) {
     }
     const updated = await client.query('UPDATE bookings SET status=$1,updated_at=now() WHERE id=$2 RETURNING *', [nextStatus, bookingId]);
     await client.query('COMMIT');
+    broadcastBookingChange(updated.rows[0], 'updated');
     return send(res, 200, { data: updated.rows[0], error: null }, headers);
   } catch (error) {
     await client.query('ROLLBACK');
@@ -857,8 +910,21 @@ async function proxyRest(req, res, url, headers) {
   for (const key of ['content-type', 'content-range', 'preference-applied']) {
     const value = response.headers.get(key); if (value) responseHeaders[key] = value;
   }
+  const responseBuffer = Buffer.from(await response.arrayBuffer());
   res.writeHead(response.status, responseHeaders);
-  res.end(Buffer.from(await response.arrayBuffer()));
+  res.end(responseBuffer);
+  if (response.ok && table === 'bookings' && ['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method)) {
+    try {
+      const payload = responseBuffer.length ? JSON.parse(responseBuffer.toString('utf8')) : [];
+      const rows = Array.isArray(payload) ? payload : [payload];
+      for (const booking of rows.filter((row) => row?.id)) {
+        const action = req.method === 'POST' ? 'created' : req.method === 'DELETE' ? 'deleted' : 'updated';
+        broadcastBookingChange(booking, action);
+      }
+    } catch (error) {
+      console.error('Failed to publish booking event:', error.message);
+    }
+  }
 }
 
 async function importRows(req, res, headers) {
@@ -942,6 +1008,7 @@ http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
     if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { status: 'ok', service: 'parapente-angola-api' }, headers);
+    if (req.method === 'GET' && url.pathname === '/events/bookings') return await streamBookingEvents(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/signup') return await signUp(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/signup/verify') return await verifySignUp(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/token') return await signIn(req, res, headers);
