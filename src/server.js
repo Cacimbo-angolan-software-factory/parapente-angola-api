@@ -22,6 +22,7 @@ const allowedOrigins = new Set((process.env.CORS_ORIGINS || '')
   .split(',').map((item) => item.trim()).filter(Boolean));
 const pool = new Pool({ connectionString: databaseUrl, max: 10 });
 const bookingEventClients = new Set();
+const weatherCache = new Map();
 
 const publicReadTables = new Set([
   'activities', 'equipment_types', 'extras', 'flight_zones', 'gallery_images',
@@ -500,6 +501,89 @@ async function sendWhatsApp(phone, message) {
     error.status = response.status;
     throw error;
   }
+}
+
+function wmoToPictocode(code) {
+  if (code === 0) return 1;
+  if (code === 1) return 2;
+  if (code === 2) return 3;
+  if (code === 3) return 4;
+  if ([45, 48].includes(code)) return 5;
+  if ([51, 53, 55, 56, 57].includes(code)) return 10;
+  if ([61, 63, 66, 67].includes(code)) return 11;
+  if (code === 65) return 12;
+  if ([71, 73, 75, 77, 85, 86].includes(code)) return 7;
+  if (code === 80) return 8;
+  if (code === 81) return 13;
+  if (code === 82) return 14;
+  if (code === 95) return 9;
+  if ([96, 99].includes(code)) return 16;
+  return 4;
+}
+
+function degreesToCompass(value) {
+  const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+  const degrees = Number(value);
+  if (!Number.isFinite(degrees)) return '';
+  return directions[Math.round(((degrees % 360) + 360) % 360 / 45) % directions.length];
+}
+
+async function getWeatherForecast(req, res, headers) {
+  const body = await jsonBody(req, 20_000);
+  const latitude = Number(body.lat);
+  const longitude = Number(body.lon);
+  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90
+    || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+    return send(res, 422, { message: 'Coordenadas geográficas inválidas.' }, headers);
+  }
+
+  const cacheKey = `${latitude.toFixed(3)},${longitude.toFixed(3)}`;
+  const cached = weatherCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return send(res, 200, cached.payload, headers);
+
+  const query = new URLSearchParams({
+    latitude: String(latitude),
+    longitude: String(longitude),
+    daily: 'weather_code,temperature_2m_max,temperature_2m_min,wind_speed_10m_max,wind_direction_10m_dominant',
+    timezone: 'auto',
+    forecast_days: '7',
+    wind_speed_unit: 'kmh',
+  });
+  let response;
+  try {
+    response = await fetch(`https://api.open-meteo.com/v1/forecast?${query}`, {
+      headers: { Accept: 'application/json', 'User-Agent': 'ParapenteAngola/1.6' },
+      signal: AbortSignal.timeout(12_000),
+    });
+  } catch (error) {
+    console.error('Weather provider request failed:', error.message);
+    return send(res, 503, { message: 'O serviço meteorológico está temporariamente indisponível.' }, headers);
+  }
+  if (!response.ok) {
+    console.error(`Weather provider returned ${response.status}`);
+    return send(res, 502, { message: 'Não foi possível obter a previsão meteorológica.' }, headers);
+  }
+  const data = await response.json();
+  const daily = data?.daily;
+  if (!Array.isArray(daily?.time)) {
+    return send(res, 502, { message: 'O serviço meteorológico devolveu uma resposta inválida.' }, headers);
+  }
+  const directions = daily.wind_direction_10m_dominant || [];
+  const payload = {
+    data_day: {
+      time: daily.time,
+      pictocode_day: (daily.weather_code || []).map(wmoToPictocode),
+      temperature_max: daily.temperature_2m_max || [],
+      temperature_min: daily.temperature_2m_min || [],
+      windspeed_max: daily.wind_speed_10m_max || [],
+      winddirection: directions,
+      winddirection_2char: directions.map(degreesToCompass),
+    },
+    metadata: { provider: 'Open-Meteo', timezone: data.timezone || 'auto', fetched_at: new Date().toISOString() },
+  };
+  weatherCache.set(cacheKey, { payload, expiresAt: Date.now() + 15 * 60_000 });
+  if (weatherCache.size > 250) weatherCache.delete(weatherCache.keys().next().value);
+  return send(res, 200, payload, headers);
 }
 
 const managedProfileFields = [
@@ -1049,6 +1133,7 @@ http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
     if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { status: 'ok', service: 'parapente-angola-api' }, headers);
+    if (req.method === 'POST' && url.pathname === '/functions/meteoblue') return await getWeatherForecast(req, res, headers);
     if (req.method === 'GET' && url.pathname === '/events/bookings') return await streamBookingEvents(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/signup') return await signUp(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/signup/verify') return await verifySignUp(req, res, headers);
