@@ -27,16 +27,19 @@ const publicReadTables = new Set([
 ]);
 const clientWriteTables = new Set(['activity_bookings', 'bookings', 'booking_extras', 'profiles']);
 const pilotWriteTables = new Set(['flight_logs', 'flight_evaluations', 'pilot_event_log', 'profiles']);
+const agentWriteTables = new Set(['bookings', 'booking_extras', 'flight_logs', 'flight_evaluations', 'pilot_event_log', 'profiles']);
 const publicRpcs = new Set(['get_active_pilots_and_students', 'get_public_pilot_profile']);
 const authenticatedRpcs = new Set(['get_admin_emails']);
 const pilotRpcs = new Set(['get_pilot_commissions']);
+const agentSensitiveTables = new Set(['agent_clients', 'agent_commission_rules', 'agent_commissions']);
 const importTables = new Set([
   'activities', 'activity_bookings', 'activity_vouchers', 'booking_extras', 'bookings',
   'equipment', 'equipment_types', 'erp_settings', 'extras', 'flight_evaluations',
   'flight_logs', 'flight_zones', 'gallery_images', 'licencas', 'payment_methods',
   'pilot_event_log', 'pilot_event_types', 'profiles', 'receipt_items', 'receipt_payments',
   'receipts', 'sponsors', 'sponsorship_pilot_allocations', 'sponsorships',
-  'training_participants', 'trainings', 'vouchers', 'platform_users',
+  'training_participants', 'trainings', 'vouchers', 'platform_users', 'agent_clients',
+  'agent_commission_rules', 'agent_commissions',
 ]);
 
 function required(name, minLength = 1) {
@@ -421,8 +424,10 @@ async function createManagedUser(req, res, headers) {
      LEFT JOIN profiles p ON p.id=u.id WHERE u.id=$1`, [auth.sub],
   );
   const admin = adminResult.rows[0];
-  if (auth.role !== 'admin' || admin?.role !== 'admin' || admin?.status !== 'active') {
-    return send(res, 403, { message: 'Apenas administradores ativos podem criar utilizadores.' }, headers);
+  const isAdmin = auth.role === 'admin' && admin?.role === 'admin';
+  const isAgent = auth.role === 'agent' && admin?.role === 'agent';
+  if ((!isAdmin && !isAgent) || admin?.status !== 'active') {
+    return send(res, 403, { message: 'Apenas administradores e agentes ativos podem criar utilizadores.' }, headers);
   }
   const body = await jsonBody(req);
   const profileInput = body.profile && typeof body.profile === 'object' ? body.profile : body;
@@ -430,7 +435,9 @@ async function createManagedUser(req, res, headers) {
   const email = String(body.email || profileInput.email || '').trim().toLowerCase();
   const password = String(body.password || '');
   const requestedRole = String(body.role || profileInput.role || 'client').toLowerCase();
-  const role = ['admin', 'client', 'pilot', 'aluno', 'student'].includes(requestedRole) ? requestedRole : 'client';
+  const role = isAgent
+    ? 'client'
+    : (['admin', 'client', 'pilot', 'agent', 'aluno', 'student'].includes(requestedRole) ? requestedRole : 'client');
   const phone = normalizePhone(profileInput.phone || body.phone) || null;
   if (!name || !/^\S+@\S+\.\S+$/.test(email) || (password && password.length < 8)) {
     return send(res, 422, { message: 'Indique nome, email válido e uma palavra-passe com pelo menos 8 caracteres, quando utilizada.' }, headers);
@@ -459,6 +466,12 @@ async function createManagedUser(req, res, headers) {
     await client.query(
       `INSERT INTO profiles (${columns.map((column) => `"${column}"`).join(',')}) VALUES (${placeholders})`, values,
     );
+    if (isAgent) {
+      await client.query(
+        'INSERT INTO agent_clients (agent_id,client_id) VALUES ($1,$2)',
+        [auth.sub, id],
+      );
+    }
     if (resetHash) {
       await client.query(
         `INSERT INTO platform_password_resets (token_hash,user_id,expires_at)
@@ -487,7 +500,7 @@ async function createManagedUser(req, res, headers) {
 
 async function updatePilotBookingStatus(req, res, headers, bookingId) {
   const auth = await authenticate(req);
-  if (!['admin', 'pilot', 'provider'].includes(auth.role)) return send(res, 403, { message: 'Operação não autorizada.' }, headers);
+  if (!['admin', 'pilot', 'provider', 'agent'].includes(auth.role)) return send(res, 403, { message: 'Operação não autorizada.' }, headers);
   const body = await jsonBody(req);
   const nextStatus = String(body.status || '');
   const allowedStatuses = ['confirmed', 'cancelled', 'completed'];
@@ -496,12 +509,13 @@ async function updatePilotBookingStatus(req, res, headers, bookingId) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const currentResult = await client.query('SELECT id,provider_id,status FROM bookings WHERE id=$1 FOR UPDATE', [bookingId]);
+    const currentResult = await client.query('SELECT id,provider_id,agent_id,status FROM bookings WHERE id=$1 FOR UPDATE', [bookingId]);
     const booking = currentResult.rows[0];
     if (!booking) { await client.query('ROLLBACK'); return send(res, 404, { message: 'Reserva não encontrada.' }, headers); }
-    if (auth.role !== 'admin' && booking.provider_id !== auth.sub) {
+    const ownsBooking = booking.provider_id === auth.sub || (auth.role === 'agent' && booking.agent_id === auth.sub);
+    if (auth.role !== 'admin' && !ownsBooking) {
       await client.query('ROLLBACK');
-      return send(res, 403, { message: 'Esta reserva não está atribuída ao piloto autenticado.' }, headers);
+      return send(res, 403, { message: 'Esta reserva não pertence ao utilizador autenticado.' }, headers);
     }
     const transitions = { pending: ['confirmed', 'cancelled'], confirmed: ['completed', 'cancelled'] };
     if (auth.role !== 'admin' && !(transitions[booking.status] || []).includes(nextStatus)) {
@@ -587,6 +601,10 @@ function ownerColumn(role, table) {
   if (['pilot', 'provider'].includes(role)) return ({
     bookings: 'provider_id', flight_logs: 'pilot_id', pilot_event_log: 'piloto_id',
   })[table] || '';
+  if (role === 'agent') return ({
+    bookings: 'agent_id', agent_clients: 'agent_id', agent_commission_rules: 'agent_id',
+    agent_commissions: 'agent_id', flight_logs: 'pilot_id', pilot_event_log: 'piloto_id',
+  })[table] || '';
   return '';
 }
 
@@ -609,7 +627,9 @@ async function verifyRelatedOwnership(role, table, buffer, userId) {
   let relation;
   if (role === 'client' && table === 'booking_extras') {
     relation = { source: 'booking_id', sql: 'SELECT id FROM bookings WHERE id = ANY($1::uuid[]) AND client_id = $2' };
-  } else if (['pilot', 'provider'].includes(role) && table === 'flight_evaluations') {
+  } else if (role === 'agent' && table === 'booking_extras') {
+    relation = { source: 'booking_id', sql: 'SELECT id FROM bookings WHERE id = ANY($1::uuid[]) AND agent_id = $2' };
+  } else if (['pilot', 'provider', 'agent'].includes(role) && table === 'flight_evaluations') {
     relation = { source: 'flight_log_id', sql: 'SELECT id FROM flight_logs WHERE id = ANY($1::uuid[]) AND pilot_id = $2' };
   } else {
     return;
@@ -624,6 +644,169 @@ async function verifyRelatedOwnership(role, table, buffer, userId) {
   if (result.rowCount !== ids.length) throw Object.assign(new Error('Operação não autorizada.'), { status: 403 });
 }
 
+async function verifyAgentBookingClients(buffer, agentId) {
+  let parsed;
+  try { parsed = JSON.parse(buffer.toString('utf8')); }
+  catch { throw Object.assign(new Error('Invalid JSON body'), { status: 400 }); }
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  const clientIds = [...new Set(rows.map((row) => row?.client_id).filter(Boolean))];
+  if (!clientIds.length) throw Object.assign(new Error('Selecione um cliente da sua carteira.'), { status: 422 });
+  const result = await pool.query(
+    'SELECT client_id FROM agent_clients WHERE agent_id=$1 AND client_id=ANY($2::uuid[])',
+    [agentId, clientIds],
+  );
+  if (result.rowCount !== clientIds.length) {
+    throw Object.assign(new Error('O cliente selecionado não pertence à carteira deste agente.'), { status: 403 });
+  }
+}
+
+function rejectAgentPilotAssignment(buffer) {
+  let parsed;
+  try { parsed = JSON.parse(buffer.toString('utf8')); }
+  catch { throw Object.assign(new Error('Invalid JSON body'), { status: 400 }); }
+  const rows = Array.isArray(parsed) ? parsed : [parsed];
+  if (rows.some((row) => row && Object.hasOwn(row, 'provider_id'))) {
+    throw Object.assign(new Error('Agentes não podem atribuir pilotos às reservas.'), { status: 403 });
+  }
+}
+
+async function getAgentOverview(req, res, headers) {
+  const auth = await authenticate(req);
+  if (auth.role !== 'agent') return send(res, 403, { message: 'Área reservada a agentes.' }, headers);
+  const profileResult = await pool.query('SELECT status FROM profiles WHERE id=$1 AND role=$2', [auth.sub, 'agent']);
+  if (profileResult.rows[0]?.status !== 'active') return send(res, 403, { message: 'Agente inativo ou suspenso.' }, headers);
+
+  const [bookings, clients, commissions, rules, receipts, paymentMethods] = await Promise.all([
+    pool.query(
+      `SELECT b.*,cp.name AS client_name,cp.phone AS client_phone,l.name AS location_name,
+              a.name AS activity_name,pp.name AS provider_name
+       FROM bookings b
+       LEFT JOIN profiles cp ON cp.id=b.client_id
+       LEFT JOIN flight_zones l ON l.id=b.location_id
+       LEFT JOIN activities a ON a.id=b.activity_id
+       LEFT JOIN profiles pp ON pp.id=b.provider_id
+       WHERE b.agent_id=$1 ORDER BY b.booking_date DESC,b.booking_time DESC LIMIT 250`,
+      [auth.sub],
+    ),
+    pool.query(
+      `SELECT p.id,p.name,p.phone,p.nif,p.status,u.email,ac.created_at
+       FROM agent_clients ac JOIN profiles p ON p.id=ac.client_id
+       LEFT JOIN platform_users u ON u.id=p.id
+       WHERE ac.agent_id=$1 ORDER BY p.name`,
+      [auth.sub],
+    ),
+    pool.query(
+      `SELECT c.*,b.booking_code,b.booking_date,b.status,l.name AS location_name,a.name AS activity_name
+       FROM agent_commissions c JOIN bookings b ON b.id=c.booking_id
+       LEFT JOIN flight_zones l ON l.id=b.location_id
+       LEFT JOIN activities a ON a.id=b.activity_id
+       WHERE c.agent_id=$1 ORDER BY b.booking_date DESC LIMIT 500`,
+      [auth.sub],
+    ),
+    pool.query(
+      `SELECT r.*,l.name AS location_name,a.name AS activity_name
+       FROM agent_commission_rules r
+       LEFT JOIN flight_zones l ON r.scope_type='location' AND l.id=r.scope_id
+       LEFT JOIN activities a ON r.scope_type='activity' AND a.id=r.scope_id
+       WHERE r.agent_id=$1 ORDER BY r.scope_type,r.created_at`,
+      [auth.sub],
+    ),
+    pool.query(
+      `SELECT r.id,r.client_id,r.issue_date,r.total_amount,r.status,p.name AS client_name,
+              COALESCE(SUM(rp.amount) FILTER (WHERE rp.type='payment'),0) AS paid_amount,
+              COALESCE(SUM(rp.amount) FILTER (WHERE rp.type='refund'),0) AS refunded_amount,
+              STRING_AGG(DISTINCT b.booking_code, ', ') AS booking_codes
+       FROM receipts r JOIN profiles p ON p.id=r.client_id
+       LEFT JOIN receipt_payments rp ON rp.receipt_id=r.id
+       LEFT JOIN receipt_items ri ON ri.receipt_id=r.id
+       LEFT JOIN bookings b ON b.id=ri.booking_id
+       WHERE r.agent_id=$1
+       GROUP BY r.id,p.name ORDER BY r.issue_date DESC,r.created_at DESC`,
+      [auth.sub],
+    ),
+    pool.query('SELECT id,name FROM payment_methods WHERE is_active=true ORDER BY name'),
+  ]);
+  return send(res, 200, { data: {
+    bookings: bookings.rows,
+    clients: clients.rows,
+    commissions: commissions.rows,
+    rules: rules.rows,
+    receipts: receipts.rows,
+    paymentMethods: paymentMethods.rows,
+  }, error: null }, headers);
+}
+
+async function manageAgentReceipt(req, res, headers) {
+  const auth = await authenticate(req);
+  if (auth.role !== 'agent') return send(res, 403, { message: 'Área reservada a agentes.' }, headers);
+  const body = await jsonBody(req);
+  const bookingId = String(body.booking_id || '');
+  const paymentAmount = body.payment_amount === undefined || body.payment_amount === '' ? 0 : Number(body.payment_amount);
+  const paymentMethodId = body.payment_method_id ? String(body.payment_method_id) : null;
+  if (!/^[0-9a-f-]{36}$/i.test(bookingId) || !Number.isFinite(paymentAmount) || paymentAmount < 0) {
+    return send(res, 422, { message: 'Reserva ou valor de pagamento inválido.' }, headers);
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const bookingResult = await client.query(
+      `SELECT b.id,b.client_id,b.total_price,b.payment_status,b.booking_code
+       FROM bookings b JOIN agent_clients ac ON ac.client_id=b.client_id AND ac.agent_id=b.agent_id
+       WHERE b.id=$1 AND b.agent_id=$2 FOR UPDATE OF b`,
+      [bookingId, auth.sub],
+    );
+    const booking = bookingResult.rows[0];
+    if (!booking) { await client.query('ROLLBACK'); return send(res, 404, { message: 'Reserva não encontrada na carteira do agente.' }, headers); }
+
+    let receiptResult = await client.query(
+      `SELECT r.* FROM receipts r JOIN receipt_items ri ON ri.receipt_id=r.id
+       WHERE ri.booking_id=$1 AND r.agent_id=$2 ORDER BY r.created_at LIMIT 1 FOR UPDATE OF r`,
+      [bookingId, auth.sub],
+    );
+    let receipt = receiptResult.rows[0];
+    if (!receipt) {
+      receiptResult = await client.query(
+        `INSERT INTO receipts(client_id,issue_date,total_amount,status,agent_id)
+         VALUES ($1,CURRENT_DATE,$2,'pending',$3) RETURNING *`,
+        [booking.client_id, Number(booking.total_price || 0), auth.sub],
+      );
+      receipt = receiptResult.rows[0];
+      await client.query(
+        `INSERT INTO receipt_items(receipt_id,booking_id,description,amount)
+         VALUES ($1,$2,'Reserva ' || $3,$4)`,
+        [receipt.id, bookingId, booking.booking_code || bookingId.slice(0, 8).toUpperCase(), Number(booking.total_price || 0)],
+      );
+    }
+
+    if (paymentAmount > 0) {
+      const methodResult = await client.query('SELECT id FROM payment_methods WHERE id=$1 AND is_active=true', [paymentMethodId]);
+      if (!methodResult.rows[0]) { await client.query('ROLLBACK'); return send(res, 422, { message: 'Selecione um método de pagamento válido.' }, headers); }
+      await client.query(
+        `INSERT INTO receipt_payments(receipt_id,payment_method_id,amount,payment_date,type,notes)
+         VALUES ($1,$2,$3,CURRENT_DATE,'payment',$4)`,
+        [receipt.id, paymentMethodId, paymentAmount, String(body.notes || '').slice(0, 500) || null],
+      );
+    }
+
+    const totals = await client.query(
+      `SELECT COALESCE(SUM(CASE WHEN type='refund' THEN -amount ELSE amount END),0) AS paid
+       FROM receipt_payments WHERE receipt_id=$1`,
+      [receipt.id],
+    );
+    const paid = Number(totals.rows[0].paid || 0);
+    const total = Number(receipt.total_amount || 0);
+    const status = paid >= total && total > 0 ? 'paid' : (paid > 0 ? 'partial' : 'pending');
+    await client.query('UPDATE receipts SET status=$1 WHERE id=$2', [status, receipt.id]);
+    await client.query('UPDATE bookings SET payment_status=$1,updated_at=now() WHERE id=$2', [status === 'pending' ? 'unpaid' : status, bookingId]);
+    await client.query('COMMIT');
+    return send(res, 200, { data: { receipt_id: receipt.id, status, paid_amount: paid, total_amount: total }, error: null }, headers);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
+}
+
 async function proxyRest(req, res, url, headers) {
   const table = restTable(url.pathname);
   const auth = await authenticate(req, req.method === 'GET' || req.method === 'HEAD');
@@ -635,11 +818,12 @@ async function proxyRest(req, res, url, headers) {
     role === 'admin'
     || publicRpcs.has(rpcName)
     || (role !== 'anon' && authenticatedRpcs.has(rpcName))
-    || (['pilot', 'provider'].includes(role) && pilotRpcs.has(rpcName))
+    || (['pilot', 'provider', 'agent'].includes(role) && pilotRpcs.has(rpcName))
   )) || (!isRpc && (role === 'admin'
-    || (read && (publicReadTables.has(table) || role !== 'anon'))
+    || (read && (publicReadTables.has(table) || (role !== 'anon' && (!agentSensitiveTables.has(table) || ['admin', 'agent'].includes(role)))))
     || (!read && role === 'client' && clientWriteTables.has(table))
-    || (!read && ['pilot', 'student', 'aluno', 'provider'].includes(role) && pilotWriteTables.has(table))));
+    || (!read && ['pilot', 'student', 'aluno', 'provider'].includes(role) && pilotWriteTables.has(table))
+    || (!read && role === 'agent' && agentWriteTables.has(table))));
   if (!allowed) return send(res, auth ? 403 : 401, { message: 'Operação não autorizada.' }, headers);
 
   const scopeColumn = auth && role !== 'admin' ? ownerColumn(role, table) : '';
@@ -654,6 +838,10 @@ async function proxyRest(req, res, url, headers) {
   for await (const chunk of req) chunks.push(chunk);
   let requestBody = Buffer.concat(chunks);
   if (auth && role !== 'admin' && !read && !isRpc) {
+    if (role === 'agent' && table === 'bookings' && req.method === 'POST') {
+      await verifyAgentBookingClients(requestBody, auth.sub);
+    }
+    if (role === 'agent' && table === 'bookings' && ['POST', 'PATCH', 'PUT'].includes(req.method)) rejectAgentPilotAssignment(requestBody);
     if (scopeColumn) {
       if (req.method !== 'POST') url.searchParams.set(scopeColumn, `eq.${auth.sub}`);
       requestBody = scopedPayload(requestBody, scopeColumn, auth.sub, table);
@@ -762,6 +950,8 @@ http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/auth/recover') return await recoverPassword(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/password') return await changePassword(req, res, headers);
     if (req.method === 'POST' && (url.pathname === '/admin/users' || url.pathname === '/functions/createClient')) return await createManagedUser(req, res, headers);
+    if (req.method === 'GET' && url.pathname === '/agent/overview') return await getAgentOverview(req, res, headers);
+    if (req.method === 'POST' && url.pathname === '/agent/receipts') return await manageAgentReceipt(req, res, headers);
     const pilotBookingStatusMatch = /^\/pilot\/bookings\/([0-9a-f-]{36})\/status$/.exec(url.pathname);
     if (pilotBookingStatusMatch && req.method === 'PATCH') return await updatePilotBookingStatus(req, res, headers, pilotBookingStatusMatch[1]);
     const xcontestPilotMatch = /^\/integrations\/xcontest\/pilots\/([0-9a-f-]{36})$/.exec(url.pathname);
