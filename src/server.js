@@ -304,13 +304,19 @@ async function signUp(req, res, headers) {
     return send(res, 422, { message: 'Preencha um nome, um contacto válido e uma palavra-passe com pelo menos 8 caracteres.' }, headers);
   }
   const existing = channel === 'email'
-    ? await pool.query('SELECT 1 FROM platform_users WHERE lower(email)=lower($1)', [email])
+    ? await pool.query(
+      'SELECT id,password_hash,guest_booking_at FROM platform_users WHERE lower(email)=lower($1)',
+      [email],
+    )
     : await pool.query(
-      `SELECT 1 FROM profiles
-       WHERE right(regexp_replace(COALESCE(phone,''),'\\D','','g'),9)=right($1,9)`,
+      `SELECT u.id,u.password_hash,u.guest_booking_at
+       FROM platform_users u LEFT JOIN profiles p ON p.id=u.id
+       WHERE u.phone=$1 OR right(regexp_replace(COALESCE(p.phone,''),'\\D','','g'),9)=right($1,9)`,
       [phone],
     );
-  if (existing.rowCount) return send(res, 409, { message: 'Já existe uma conta com este contacto.' }, headers);
+  if (existing.rowCount && !existing.rows[0].guest_booking_at) {
+    return send(res, 409, { message: 'Já existe uma conta com este contacto.' }, headers);
+  }
 
   const recent = await pool.query(
     `SELECT count(*)::int AS total FROM platform_signup_challenges
@@ -354,6 +360,162 @@ function normalizePhone(value) {
   if (digits.startsWith('00244')) digits = digits.slice(2);
   if (digits.length === 9 && digits.startsWith('9')) digits = `244${digits}`;
   return digits;
+}
+
+function guestText(value, maxLength = 500) {
+  return String(value || '').trim().slice(0, maxLength);
+}
+
+function guestBookingCode() {
+  return `PA-${randomBytes(4).toString('hex').toUpperCase()}`;
+}
+
+async function createGuestBooking(req, res, headers) {
+  const body = await jsonBody(req);
+  const details = body.client_details && typeof body.client_details === 'object' ? body.client_details : body;
+  const name = guestText(details.name, 160);
+  const email = guestText(details.email, 254).toLowerCase();
+  const phone = normalizePhone(details.phone);
+  const notificationContact = guestText(details.notificationContact, 254) || email || phone;
+  const locationId = guestText(body.location_id || details.locationId, 36);
+  const activityId = guestText(body.activity_id || details.activityId, 36) || null;
+  const providerId = guestText(body.provider_id || details.providerId, 36) || null;
+  const bookingDate = guestText(body.booking_date || details.preferredDate, 10);
+  const bookingTime = guestText(body.booking_time || details.preferredTime, 8);
+  const extraIds = [...new Set(Array.isArray(body.extra_ids) ? body.extra_ids.map((id) => guestText(id, 36)).filter(Boolean) : [])];
+  const voucherId = guestText(body.voucher_id, 36) || null;
+  const age = Number(details.age);
+  const weight = Number(details.weight);
+
+  if (!name || (!/^\S+@\S+\.\S+$/.test(email) && !/^2449\d{8}$/.test(phone))
+      || !/^[0-9a-f-]{36}$/i.test(locationId) || !/^\d{4}-\d{2}-\d{2}$/.test(bookingDate)
+      || !/^\d{2}:\d{2}(:\d{2})?$/.test(bookingTime) || !Number.isFinite(age) || age < 16 || age > 80
+      || !Number.isFinite(weight) || weight < 40 || weight > 120 || details.acceptTerms !== true) {
+    return send(res, 422, { message: 'Indique os dados obrigatórios, um email ou WhatsApp válido e aceite o termo de responsabilidade.' }, headers);
+  }
+  if (bookingDate < new Date().toISOString().slice(0, 10)) {
+    return send(res, 422, { message: 'Escolha uma data futura para a reserva.' }, headers);
+  }
+  if ((activityId && !/^[0-9a-f-]{36}$/i.test(activityId))
+      || (providerId && !/^[0-9a-f-]{36}$/i.test(providerId))
+      || (voucherId && !/^[0-9a-f-]{36}$/i.test(voucherId))
+      || extraIds.some((id) => !/^[0-9a-f-]{36}$/i.test(id))) {
+    return send(res, 422, { message: 'Um dos dados da reserva é inválido.' }, headers);
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const locationResult = await client.query(
+      'SELECT id,price FROM flight_zones WHERE id=$1 AND is_active=true FOR SHARE', [locationId],
+    );
+    if (!locationResult.rowCount) throw Object.assign(new Error('O local selecionado já não está disponível.'), { status: 422 });
+
+    let activity = null;
+    if (activityId) {
+      const activityResult = await client.query(
+        'SELECT id,location_id,price FROM activities WHERE id=$1 FOR SHARE', [activityId],
+      );
+      activity = activityResult.rows[0];
+      if (!activity || (activity.location_id && activity.location_id !== locationId)) {
+        throw Object.assign(new Error('A atividade selecionada não está disponível neste local.'), { status: 422 });
+      }
+    }
+    if (providerId) {
+      const provider = await client.query(
+        "SELECT id FROM profiles WHERE id=$1 AND status='active' AND role IN ('pilot','provider','aluno','student') FOR SHARE",
+        [providerId],
+      );
+      if (!provider.rowCount) throw Object.assign(new Error('O responsável selecionado não está disponível.'), { status: 422 });
+      const conflict = await client.query(
+        "SELECT id FROM bookings WHERE provider_id=$1 AND booking_date=$2 AND booking_time=$3 AND status <> 'cancelled' FOR UPDATE",
+        [providerId, bookingDate, bookingTime],
+      );
+      if (conflict.rowCount) throw Object.assign(new Error('O responsável selecionado já tem uma atividade nesse horário.'), { status: 409 });
+    }
+
+    const extrasResult = extraIds.length
+      ? await client.query('SELECT id,price FROM extras WHERE id = ANY($1::uuid[]) AND is_active=true FOR SHARE', [extraIds])
+      : { rows: [] };
+    if (extrasResult.rows.length !== extraIds.length) throw Object.assign(new Error('Um dos extras selecionados já não está disponível.'), { status: 422 });
+
+    let discount = 0;
+    let voucher = null;
+    const basePrice = Number(activity?.price ?? locationResult.rows[0].price ?? 0)
+      + extrasResult.rows.reduce((sum, extra) => sum + Number(extra.price || 0), 0);
+    if (voucherId) {
+      const voucherResult = await client.query('SELECT * FROM vouchers WHERE id=$1 FOR UPDATE', [voucherId]);
+      voucher = voucherResult.rows[0];
+      if (!voucher?.is_active || (voucher.expiry_date && voucher.expiry_date < bookingDate)
+          || (voucher.usage_limit && voucher.times_used >= voucher.usage_limit)
+          || (voucher.min_booking_value && basePrice < Number(voucher.min_booking_value))) {
+        throw Object.assign(new Error('O voucher não pode ser aplicado a esta reserva.'), { status: 422 });
+      }
+      discount = voucher.discount_type === 'percentage'
+        ? basePrice * (Number(voucher.discount_value) / 100)
+        : Number(voucher.discount_value);
+      discount = Math.min(basePrice, Math.max(0, discount));
+    }
+
+    const contactLock = email || phone;
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [contactLock]);
+    const existing = await client.query(
+      `SELECT u.id,u.password_hash,u.guest_booking_at FROM platform_users u
+       LEFT JOIN profiles p ON p.id=u.id
+       WHERE ($1::text <> '' AND lower(u.email)=lower($1)) OR ($2::text <> '' AND (u.phone=$2 OR p.phone=$2))
+       FOR UPDATE`,
+      [email, phone],
+    );
+    let clientId;
+    if (existing.rowCount) {
+      const account = existing.rows[0];
+      if (!account.guest_booking_at || account.password_hash) {
+        throw Object.assign(new Error('Este contacto já tem uma conta. Inicie sessão para concluir a reserva.'), { status: 409 });
+      }
+      clientId = account.id;
+      await client.query(
+        'UPDATE profiles SET name=$2,phone=COALESCE($3,phone),updated_at=now() WHERE id=$1', [clientId, name, phone || null],
+      );
+    } else {
+      clientId = randomUUID();
+      await client.query(
+        `INSERT INTO platform_users (id,email,phone,role,guest_booking_at)
+         VALUES ($1,$2,$3,'client',now())`,
+        [clientId, email || `${phone}@whatsapp.parapenteangola.invalid`, phone || null],
+      );
+      await client.query(
+        `INSERT INTO profiles (id,name,phone,role,status) VALUES ($1,$2,$3,'client','active')`,
+        [clientId, name, phone || null],
+      );
+    }
+
+    const booking = await client.query(
+      `INSERT INTO bookings
+        (client_id,provider_id,activity_id,location_id,booking_date,booking_time,status,total_price,booking_code,voucher_id,discount_amount,client_details)
+       VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10,$11::jsonb)
+       RETURNING *`,
+      [clientId, providerId, activityId, locationId, bookingDate, bookingTime, basePrice - discount, guestBookingCode(), voucherId, discount,
+        JSON.stringify({
+          name, age, weight, gender: guestText(details.gender, 40), nationality: guestText(details.nationality, 100), phone, email,
+          clientType: guestText(details.clientType, 50) || 'individual', emergencyContactName: guestText(details.emergencyContactName, 160),
+          emergencyContactPhone: guestText(details.emergencyContactPhone, 60), medicalConditions: guestText(details.medicalConditions, 1000),
+          notificationChannel: guestText(details.notificationChannel, 20) || (phone ? 'whatsapp' : 'email'), notificationContact,
+          guest_booking: true,
+        })],
+    );
+    if (extraIds.length) {
+      await client.query(
+        'INSERT INTO booking_extras (booking_id,extra_id) SELECT $1,unnest($2::uuid[])', [booking.rows[0].id, extraIds],
+      );
+    }
+    if (voucher) await client.query('UPDATE vouchers SET times_used=times_used+1,updated_at=now() WHERE id=$1', [voucher.id]);
+    await client.query('COMMIT');
+    broadcastBookingChange(booking.rows[0], 'created');
+    return send(res, 201, { data: { booking: { id: booking.rows[0].id, booking_code: booking.rows[0].booking_code, status: 'pending' } }, error: null }, headers);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
 }
 
 function signupCodeHash(challengeId, code) {
@@ -487,21 +649,45 @@ async function verifySignUp(req, res, headers) {
     return send(res, 400, { message: 'O código introduzido não está correto.' }, headers);
   }
 
-  const id = randomUUID();
   const storedEmail = challenge.email || `${challenge.phone}@whatsapp.parapenteangola.invalid`;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [challenge.contact]);
-    const created = await client.query(
-      `INSERT INTO platform_users (id,email,phone,password_hash,role,email_confirmed_at,phone_confirmed_at)
-       VALUES ($1,$2,$3,$4,'client',$5,$6) RETURNING id,email,phone,role`,
-      [id, storedEmail, challenge.phone, challenge.password_hash, challenge.email ? new Date() : null, challenge.phone ? new Date() : null],
+    const guest = await client.query(
+      `SELECT id FROM platform_users
+       WHERE guest_booking_at IS NOT NULL
+         AND (($1::text IS NOT NULL AND lower(email)=lower($1)) OR ($2::text IS NOT NULL AND phone=$2))
+       FOR UPDATE`,
+      [challenge.email, challenge.phone],
     );
-    await client.query(
-      `INSERT INTO profiles (id,name,phone,role,status) VALUES ($1,$2,$3,'client','active')`,
-      [id, challenge.name, challenge.phone],
-    );
+    let created;
+    if (guest.rowCount) {
+      const id = guest.rows[0].id;
+      created = await client.query(
+        `UPDATE platform_users
+         SET email=$2,phone=COALESCE($3,phone),password_hash=$4,role='client',guest_booking_at=NULL,
+             email_confirmed_at=CASE WHEN $5::boolean THEN now() ELSE email_confirmed_at END,
+             phone_confirmed_at=CASE WHEN $6::boolean THEN now() ELSE phone_confirmed_at END,updated_at=now()
+         WHERE id=$1 RETURNING id,email,phone,role`,
+        [id, storedEmail, challenge.phone, challenge.password_hash, Boolean(challenge.email), Boolean(challenge.phone)],
+      );
+      await client.query(
+        `UPDATE profiles SET name=$2,phone=COALESCE($3,phone),role='client',status='active',updated_at=now() WHERE id=$1`,
+        [id, challenge.name, challenge.phone],
+      );
+    } else {
+      const id = randomUUID();
+      created = await client.query(
+        `INSERT INTO platform_users (id,email,phone,password_hash,role,email_confirmed_at,phone_confirmed_at)
+         VALUES ($1,$2,$3,$4,'client',$5,$6) RETURNING id,email,phone,role`,
+        [id, storedEmail, challenge.phone, challenge.password_hash, challenge.email ? new Date() : null, challenge.phone ? new Date() : null],
+      );
+      await client.query(
+        `INSERT INTO profiles (id,name,phone,role,status) VALUES ($1,$2,$3,'client','active')`,
+        [id, challenge.name, challenge.phone],
+      );
+    }
     await client.query('DELETE FROM platform_signup_challenges WHERE id=$1', [challengeId]);
     await client.query('COMMIT');
     return send(res, 200, { data: await issueSession(created.rows[0]), error: null }, headers);
@@ -1222,6 +1408,7 @@ http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/auth/user') return await currentUser(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/recover') return await recoverPassword(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/password') return await changePassword(req, res, headers);
+    if (req.method === 'POST' && url.pathname === '/bookings/guest') return await createGuestBooking(req, res, headers);
     if (req.method === 'POST' && (url.pathname === '/admin/users' || url.pathname === '/functions/createClient')) return await createManagedUser(req, res, headers);
     if (req.method === 'GET' && url.pathname === '/agent/overview') return await getAgentOverview(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/agent/receipts') return await manageAgentReceipt(req, res, headers);
