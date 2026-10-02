@@ -769,6 +769,38 @@ async function sendWhatsApp(phone, message) {
   }
 }
 
+async function getPublicLicense(req, res, headers, licenseId) {
+  const result = await pool.query(
+    `SELECT l.id,l.numero_licenca,l.license_type,l.nome_completo,l.nivel_certificacao,
+            l.data_emissao,l.data_validade,p.role,p.status AS holder_status
+     FROM licencas l
+     LEFT JOIN profiles p ON p.id=l.piloto_id
+     WHERE l.id=$1
+     ORDER BY l.created_at DESC LIMIT 1`,
+    [licenseId],
+  );
+  const license = result.rows[0];
+  if (!license) return send(res, 404, { message: 'Licença não encontrada.' }, headers);
+
+  const today = new Date().toISOString().slice(0, 10);
+  const validity = license.data_validade < today
+    ? 'expired'
+    : license.data_validade <= new Date(Date.now() + 30 * 86_400_000).toISOString().slice(0, 10)
+      ? 'expiring'
+      : 'valid';
+  return send(res, 200, { data: {
+    id: license.id,
+    number: license.numero_licenca,
+    holder_name: license.nome_completo,
+    holder_type: license.license_type === 'agent' ? 'agent' : 'pilot',
+    level: license.nivel_certificacao,
+    issued_at: license.data_emissao,
+    valid_until: license.data_validade,
+    validity,
+    holder_active: license.holder_status ? license.holder_status === 'active' : true,
+  }, error: null }, headers);
+}
+
 function wmoToPictocode(code) {
   if (code === 0) return 1;
   if (code === 1) return 2;
@@ -1417,6 +1449,8 @@ http.createServer(async (req, res) => {
     const xcontestPilotMatch = /^\/integrations\/xcontest\/pilots\/([0-9a-f-]{36})$/.exec(url.pathname);
     if (xcontestPilotMatch && req.method === 'GET') return await getXContestPilot(req, res, headers, xcontestPilotMatch[1]);
     if (xcontestPilotMatch && req.method === 'PUT') return await saveXContestPilot(req, res, headers, xcontestPilotMatch[1]);
+    const publicLicenseMatch = /^\/licenses\/([0-9a-f-]{36})$/.exec(url.pathname);
+    if (publicLicenseMatch && req.method === 'GET') return await getPublicLicense(req, res, headers, publicLicenseMatch[1]);
     const xcontestImportMatch = /^\/integrations\/xcontest\/pilots\/([0-9a-f-]{36})\/flights\/igc$/.exec(url.pathname);
     if (xcontestImportMatch && req.method === 'POST') return await importIgcFlight(req, res, headers, xcontestImportMatch[1]);
     const xcontestDeleteMatch = /^\/integrations\/xcontest\/pilots\/([0-9a-f-]{36})\/flights\/([0-9a-f-]{36})$/.exec(url.pathname);
