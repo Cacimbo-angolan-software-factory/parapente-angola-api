@@ -10,5 +10,5 @@ test('public licence verification exposes only safe verification fields', () => 
   assert.match(source, /holder_name/);
   assert.match(source, /valid_until/);
   assert.match(source, /validity/);
-  assert.doesNotMatch(source.match(/async function getPublicLicense[\s\S]*?\n}\n\nasync function/)[0], /numero_identificacao|data_nascimento|endereco|condicoes_medicas/);
+  assert.doesNotMatch(source.slice(source.indexOf('async function getPublicLicense'), source.indexOf('function wmoToPictocode')), /numero_identificacao|data_nascimento|endereco|condicoes_medicas/);
 });

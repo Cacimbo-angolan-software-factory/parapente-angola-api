@@ -14,7 +14,8 @@ const jwtSecret = new TextEncoder().encode(jwtSecretValue);
 const migrationToken = process.env.MIGRATION_TOKEN || '';
 const postgrestUrl = process.env.POSTGREST_URL || 'http://postgrest:3000';
 const smtpEndpoint = process.env.SMTP_ENDPOINT || '';
-const whatsappEndpoint = process.env.WHATSAPP_ENDPOINT || 'https://cacimboerp.cacimboweb.com/api/send-message-whatsapp';
+const whatsappEndpoint = process.env.WHATSAPP_ENDPOINT || '';
+const whatsappApiToken = process.env.WHATSAPP_API_TOKEN || '';
 const frontendUrl = (process.env.FRONTEND_URL || 'https://www.parapenteangola.com').replace(/\/+$/, '');
 const platformNotificationEmail = process.env.ADMIN_NOTIFICATION_EMAIL || 'info@cacimboerp.com';
 const accessTokenTtlSeconds = Math.min(Math.max(Number(process.env.ACCESS_TOKEN_TTL_SECONDS || 14400), 900), 86400);
@@ -340,7 +341,7 @@ async function signUp(req, res, headers) {
     if (channel === 'email') {
       await sendEmail(email, 'Confirmar registo — Parapente Angola', `<p>${message}</p><p>Se não pediu este registo, ignore esta mensagem.</p>`, challengeId);
     } else {
-      await sendWhatsApp(phone, message);
+      await sendWhatsApp(phone, message, { purpose: 'verification', code });
     }
     return send(res, 200, { data: { challenge_id: challengeId, verification_required: true, channel, contact_hint: maskContact(channel, contact), expires_in: 600 }, error: null }, headers);
   } catch (error) {
@@ -755,14 +756,15 @@ async function sendEmail(to, subject, html, subjectId) {
   if (!response.ok) throw new Error(`SMTP endpoint returned ${response.status}`);
 }
 
-async function sendWhatsApp(phone, message) {
-  if (!whatsappEndpoint) throw new Error('WhatsApp endpoint is not configured');
+async function sendWhatsApp(phone, message, { purpose = 'notification', code } = {}) {
+  if (!whatsappEndpoint || !whatsappApiToken) throw new Error('WhatsApp bridge is not configured');
   const response = await fetch(whatsappEndpoint, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message_body: message, number: phone, country: 'AO', country_code: '244' }),
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${whatsappApiToken}` },
+    body: JSON.stringify({ message_body: message, number: phone, purpose, ...(code ? { code } : {}) }),
   });
-  if (!response.ok) {
+  const result = await response.json().catch(() => null);
+  if (!response.ok || result?.status !== 'accepted' || !result?.provider_message_id) {
     const error = new Error(`Cacimbo WhatsApp endpoint returned ${response.status}`);
     error.status = response.status;
     throw error;
