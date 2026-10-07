@@ -254,6 +254,11 @@ function bearer(req) {
   return match?.[1] || null;
 }
 
+function normalizeRole(role) {
+  const value = String(role || '').trim().toLowerCase();
+  return value === 'administrador' ? 'admin' : value || 'client';
+}
+
 async function authenticate(req, optional = false) {
   const token = bearer(req);
   if (!token) {
@@ -269,7 +274,8 @@ async function authenticate(req, optional = false) {
 }
 
 async function issueSession(user) {
-  const accessToken = await new SignJWT({ role: user.role || 'client', email: user.email })
+  const role = normalizeRole(user.role);
+  const accessToken = await new SignJWT({ role, email: user.email })
     .setProtectedHeader({ alg: 'HS256' }).setSubject(user.id)
     .setIssuer('parapente-angola-api').setAudience('parapente-angola')
     .setIssuedAt().setExpirationTime(`${accessTokenTtlSeconds}s`).sign(jwtSecret);
@@ -287,7 +293,7 @@ async function issueSession(user) {
       id: user.id,
       email: user.email?.endsWith('@whatsapp.parapenteangola.invalid') ? '' : user.email,
       phone: user.phone || profile.rows[0]?.phone || '',
-      role: user.role || 'client',
+      role,
       user_metadata: { name: profile.rows[0]?.name || user.name || '' },
     },
   };
@@ -715,7 +721,7 @@ async function signIn(req, res, headers) {
   if (user.status === 'suspended' || user.status === 'inactive') {
     return send(res, 403, { message: 'Esta conta não está ativa.' }, headers);
   }
-  user.role = user.effective_role;
+  user.role = normalizeRole(user.effective_role);
   await pool.query('UPDATE platform_users SET last_sign_in_at=now(), updated_at=now() WHERE id=$1', [user.id]);
   return send(res, 200, { data: await issueSession(user), error: null }, headers);
 }
@@ -726,8 +732,9 @@ async function refresh(req, res, headers) {
   const hash = createHash('sha256').update(raw).digest('hex');
   const result = await pool.query(
     `DELETE FROM platform_refresh_tokens r USING platform_users u
+     LEFT JOIN profiles p ON p.id=u.id
      WHERE r.token_hash=$1 AND r.user_id=u.id AND r.expires_at>now()
-     RETURNING u.id,u.email,u.role`, [hash],
+     RETURNING u.id,u.email,u.phone,COALESCE(p.role,u.role) AS role`, [hash],
   );
   if (!result.rows[0]) return send(res, 401, { message: 'Sessão expirada.' }, headers);
   return send(res, 200, { data: await issueSession(result.rows[0]), error: null }, headers);
@@ -975,6 +982,103 @@ async function createManagedUser(req, res, headers) {
   return send(res, 201, { data: { user: { id, email, role, name }, invitation_sent: invitationSent }, error: null }, headers);
 }
 
+async function requireActiveAdmin(req) {
+  const auth = await authenticate(req);
+  if (normalizeRole(auth.role) !== 'admin') throw Object.assign(new Error('Apenas administradores podem executar esta operação.'), { status: 403 });
+  const result = await pool.query('SELECT role,status FROM profiles WHERE id=$1', [auth.sub]);
+  if (normalizeRole(result.rows[0]?.role) !== 'admin' || result.rows[0]?.status !== 'active') {
+    throw Object.assign(new Error('Apenas administradores activos podem executar esta operação.'), { status: 403 });
+  }
+  return auth;
+}
+
+async function renewLicense(req, res, headers) {
+  const auth = await requireActiveAdmin(req);
+  const body = await jsonBody(req);
+  const licenseId = String(body.license_id || '').trim();
+  if (!/^[0-9a-f-]{36}$/i.test(licenseId)) return send(res, 422, { message: 'Licença inválida.' }, headers);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const licenseResult = await client.query('SELECT * FROM licencas WHERE id=$1 FOR UPDATE', [licenseId]);
+    const license = licenseResult.rows[0];
+    if (!license) { await client.query('ROLLBACK'); return send(res, 404, { message: 'Licença não encontrada.' }, headers); }
+    if (!license.piloto_id) { await client.query('ROLLBACK'); return send(res, 422, { message: 'A licença não está associada a um sócio.' }, headers); }
+    const type = license.license_type === 'agent' ? 'agent' : 'pilot';
+    const pending = await client.query(`SELECT id FROM license_renewals WHERE license_id=$1 AND status='pending' LIMIT 1`, [licenseId]);
+    if (pending.rowCount) { await client.query('ROLLBACK'); return send(res, 409, { message: 'Já existe uma cobrança pendente para esta licença.' }, headers); }
+    const feeResult = await client.query(
+      `SELECT amount,currency FROM license_fee_rules
+       WHERE license_type=$1 AND active=true AND effective_from<=CURRENT_DATE
+         AND (effective_to IS NULL OR effective_to>=CURRENT_DATE)
+       ORDER BY effective_from DESC, created_at DESC LIMIT 1`, [type],
+    );
+    const fee = feeResult.rows[0];
+    if (!fee) {
+      await client.query('ROLLBACK');
+      return send(res, 422, { message: `Configure primeiro o preço de renovação para ${type === 'agent' ? 'agentes' : 'pilotos'}.` }, headers);
+    }
+    const currentYear = new Date().getUTCFullYear();
+    const expiryYear = Number(String(license.data_validade || '').slice(0, 4)) || currentYear;
+    const nextYear = Math.max(currentYear + 1, expiryYear + 1);
+    const periodStart = `${nextYear}-01-01`;
+    const periodEnd = `${nextYear}-12-31`;
+    const renewal = await client.query(
+      `INSERT INTO license_renewals
+        (license_id,member_id,license_type,period_start,period_end,amount_due,currency,status,created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',$8) RETURNING *`,
+      [licenseId, license.piloto_id, type, periodStart, periodEnd, fee.amount, fee.currency, auth.sub],
+    );
+    const renewalId = renewal.rows[0].id;
+    const created = await client.query(
+      `INSERT INTO licencas
+        (piloto_id,nome_completo,data_nascimento,numero_identificacao,endereco,nacionalidade,
+         data_emissao,data_validade,nivel_certificacao,numero_horas_voo,escola_treinamento,
+         assinatura_piloto,assinatura_instrutor,condicoes_medicas,apolice,tipo_cobertura,
+         observacoes_especiais,numero_licenca,license_type,billing_status,renewal_id,created_by_user_id)
+       SELECT piloto_id,nome_completo,data_nascimento,numero_identificacao,endereco,nacionalidade,
+         $2,$3,nivel_certificacao,numero_horas_voo,escola_treinamento,assinatura_piloto,
+         assinatura_instrutor,condicoes_medicas,apolice,tipo_cobertura,observacoes_especiais,
+         numero_licenca,$4,'pending',$1,$5 FROM licencas WHERE id=$6 RETURNING *`,
+      [renewalId, periodStart, periodEnd, type, auth.sub, licenseId],
+    );
+    await client.query('UPDATE license_renewals SET new_license_id=$1,updated_at=now() WHERE id=$2', [created.rows[0].id, renewalId]);
+    await client.query('COMMIT');
+    return send(res, 201, { data: { renewal: { ...renewal.rows[0], new_license_id: created.rows[0].id }, license: created.rows[0] }, error: null }, headers);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
+}
+
+async function updateLicenseRenewalStatus(req, res, headers, renewalId) {
+  const auth = await requireActiveAdmin(req);
+  const body = await jsonBody(req);
+  const status = String(body.status || '').toLowerCase();
+  if (!['paid', 'cancelled', 'waived'].includes(status)) return send(res, 422, { message: 'Estado de cobrança inválido.' }, headers);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const renewalResult = await client.query('SELECT * FROM license_renewals WHERE id=$1 FOR UPDATE', [renewalId]);
+    const renewal = renewalResult.rows[0];
+    if (!renewal) { await client.query('ROLLBACK'); return send(res, 404, { message: 'Cobrança não encontrada.' }, headers); }
+    const amountPaid = status === 'paid' ? renewal.amount_due : 0;
+    const updated = await client.query(
+      `UPDATE license_renewals SET status=$1,amount_paid=$2,payment_method_id=COALESCE($3,payment_method_id),
+         paid_at=CASE WHEN $1='paid' THEN now() ELSE NULL END,updated_at=now(),notes=COALESCE($4,notes)
+       WHERE id=$5 RETURNING *`,
+      [status, amountPaid, body.payment_method_id || null, body.notes || null, renewalId],
+    );
+    if (renewal.new_license_id) await client.query('UPDATE licencas SET billing_status=$1 WHERE id=$2', [status, renewal.new_license_id]);
+    await client.query('COMMIT');
+    return send(res, 200, { data: { ...updated.rows[0], updated_by: auth.sub }, error: null }, headers);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
+}
+
 async function updatePilotBookingStatus(req, res, headers, bookingId) {
   const auth = await authenticate(req);
   if (!['admin', 'pilot', 'provider', 'agent'].includes(auth.role)) return send(res, 403, { message: 'Operação não autorizada.' }, headers);
@@ -1073,6 +1177,7 @@ function restTable(pathname) {
 
 function ownerColumn(role, table) {
   if (table === 'profiles') return 'id';
+  if (['membership_quotas', 'license_renewals'].includes(table)) return 'member_id';
   if (role === 'client') return ({
     activity_bookings: 'client_id', bookings: 'client_id', receipts: 'client_id',
   })[table] || '';
@@ -1288,7 +1393,7 @@ async function manageAgentReceipt(req, res, headers) {
 async function proxyRest(req, res, url, headers) {
   const table = restTable(url.pathname);
   const auth = await authenticate(req, req.method === 'GET' || req.method === 'HEAD');
-  const role = auth?.role || 'anon';
+  const role = auth ? normalizeRole(auth.role) : 'anon';
   const isRpc = url.pathname.startsWith('/rest/v1/rpc/');
   const rpcName = isRpc ? url.pathname.slice('/rest/v1/rpc/'.length).split('/')[0] : '';
   const read = req.method === 'GET' || req.method === 'HEAD';
@@ -1444,6 +1549,9 @@ http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/auth/password') return await changePassword(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/bookings/guest') return await createGuestBooking(req, res, headers);
     if (req.method === 'POST' && (url.pathname === '/admin/users' || url.pathname === '/functions/createClient')) return await createManagedUser(req, res, headers);
+    if (req.method === 'POST' && url.pathname === '/admin/licenses/renew') return await renewLicense(req, res, headers);
+    const licenseRenewalStatusMatch = /^\/admin\/license-renewals\/([0-9a-f-]{36})\/status$/.exec(url.pathname);
+    if (licenseRenewalStatusMatch && req.method === 'PATCH') return await updateLicenseRenewalStatus(req, res, headers, licenseRenewalStatusMatch[1]);
     if (req.method === 'GET' && url.pathname === '/agent/overview') return await getAgentOverview(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/agent/receipts') return await manageAgentReceipt(req, res, headers);
     const pilotBookingStatusMatch = /^\/pilot\/bookings\/([0-9a-f-]{36})\/status$/.exec(url.pathname);
