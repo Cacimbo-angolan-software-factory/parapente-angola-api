@@ -5,6 +5,7 @@ import bcrypt from 'bcryptjs';
 import { SignJWT, jwtVerify } from 'jose';
 import pg from 'pg';
 import { parseIgc } from './igc.js';
+import { managedProfileValues } from './managedProfile.js';
 
 const { Pool } = pg;
 const port = Number(process.env.PORT || 8080);
@@ -938,7 +939,7 @@ async function createManagedUser(req, res, headers) {
   if (phone) profile.phone = phone;
 
   const columns = ['id', ...Object.keys(profile)];
-  const values = [id, ...Object.values(profile)];
+  const values = managedProfileValues(id, profile);
   const placeholders = values.map((_, index) => `$${index + 1}`).join(',');
   const client = await pool.connect();
   try {
