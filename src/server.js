@@ -91,6 +91,9 @@ function broadcastBookingChange(booking, action = 'updated') {
     try { client.res.write(data); }
     catch { bookingEventClients.delete(client); }
   }
+  void deliverClientBookingNotification(booking, action).catch((error) => {
+    console.error('Failed to deliver client booking notification:', error.message);
+  });
   void deliverBookingNotification(booking, action).catch((error) => {
     console.error('Failed to deliver booking notification:', error.message);
   });
@@ -103,6 +106,59 @@ function escapeHtml(value) {
   return String(value || '')
     .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;').replaceAll("'", '&#039;');
+}
+
+
+const bookingPaymentAccounts = [
+  ['BAI', '004000004558016710160'],
+  ['BIC', '005100006517668014141'],
+  ['BFA', '000600002783826830151'],
+  ['BMA', '005500006492479310166'],
+  ['BCI', '000500003532051410197'],
+];
+const bookingPaymentExpress = '930120001';
+
+async function deliverClientBookingNotification(booking, action) {
+  if (!booking?.id || action !== 'created') return;
+  const result = await pool.query(
+    `SELECT b.*,p.name AS client_name,p.phone AS client_phone,u.email AS client_email
+     FROM bookings b
+     LEFT JOIN profiles p ON p.id=b.client_id
+     LEFT JOIN platform_users u ON u.id=b.client_id
+     WHERE b.id=$1`,
+    [booking.id],
+  );
+  const details = { ...booking, ...(result.rows[0] || {}) };
+  const contact = details.client_details || {};
+  const name = contact.name || details.client_name || 'Cliente';
+  const phone = normalizePhone(contact.phone || details.client_phone);
+  const rawEmail = String(contact.email || details.client_email || '').trim();
+  const email = rawEmail.endsWith('@whatsapp.parapenteangola.invalid') ? '' : rawEmail;
+  const code = details.booking_code || booking.id.slice(0, 8).toUpperCase();
+  const lines = [
+    `Olá ${name},`,
+    `Recebemos a sua reserva ${code} — Parapente Angola.`,
+    `Data: ${details.booking_date || 'A confirmar'} ${details.booking_time || ''}`.trim(),
+    'Coordenadas bancárias para pagamento:',
+    ...bookingPaymentAccounts.map(([bank, account]) => `${bank}: ${account}`),
+    `Express: ${bookingPaymentExpress}`,
+    `Use o código ${code} como referência do pagamento.`,
+  ];
+  const deliveries = [];
+  if (/^2449\d{8}$/.test(phone)) {
+    deliveries.push(sendWhatsApp(phone, lines.join('\n')));
+  }
+  if (/^\S+@\S+\.\S+$/.test(email)) {
+    const html = lines.map((line) => `<p>${escapeHtml(line)}</p>`).join('');
+    deliveries.push(sendEmail(email, `Dados de pagamento da reserva ${code} — Parapente Angola`, html, booking.id));
+  }
+  const results = await Promise.allSettled(deliveries);
+  for (const result of results) {
+    if (result.status === 'rejected') console.error('Client booking notification channel failed:', result.reason?.message || result.reason);
+  }
+  if (deliveries.length && results.every((result) => result.status === 'rejected')) {
+    throw new Error('All configured client booking notification channels failed');
+  }
 }
 
 async function deliverBookingNotification(booking, action) {
@@ -1433,6 +1489,13 @@ async function proxyRest(req, res, url, headers) {
       await verifyRelatedOwnership(role, table, requestBody, auth.sub);
     }
   }
+  // Booking notifications need the inserted rows even when callers request no body.
+  const captureCreatedBookings = table === 'bookings' && req.method === 'POST';
+  const originalPrefer = upstreamHeaders.prefer || '';
+  if (captureCreatedBookings) {
+    upstreamHeaders.prefer = [...originalPrefer.split(',').map((value) => value.trim())
+      .filter((value) => value && !value.startsWith('return=')), 'return=representation'].join(',');
+  }
   const response = await fetch(`${postgrestUrl}${url.pathname.replace('/rest/v1', '')}${url.search}`, {
     method: req.method, headers: upstreamHeaders,
     body: read ? undefined : requestBody,
@@ -1442,8 +1505,12 @@ async function proxyRest(req, res, url, headers) {
     const value = response.headers.get(key); if (value) responseHeaders[key] = value;
   }
   const responseBuffer = Buffer.from(await response.arrayBuffer());
+  const suppressCreatedBody = captureCreatedBookings && !originalPrefer.split(',').some((value) => value.trim() === 'return=representation');
+  if (suppressCreatedBody && responseHeaders['preference-applied']) {
+    responseHeaders['preference-applied'] = responseHeaders['preference-applied'].replace('return=representation', 'return=minimal');
+  }
   res.writeHead(response.status, responseHeaders);
-  res.end(responseBuffer);
+  res.end(suppressCreatedBody ? undefined : responseBuffer);
   if (response.ok && table === 'bookings' && ['POST', 'PATCH', 'PUT', 'DELETE'].includes(req.method)) {
     try {
       const payload = responseBuffer.length ? JSON.parse(responseBuffer.toString('utf8')) : [];
