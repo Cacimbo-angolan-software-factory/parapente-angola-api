@@ -6,6 +6,7 @@ import { SignJWT, jwtVerify } from 'jose';
 import pg from 'pg';
 import { parseIgc } from './igc.js';
 import { managedProfileValues } from './managedProfile.js';
+import { createCommerceHandler } from './commerce.js';
 
 const { Pool } = pg;
 const port = Number(process.env.PORT || 8080);
@@ -744,7 +745,7 @@ async function refresh(req, res, headers) {
 async function currentUser(req, res, headers) {
   const auth = await authenticate(req);
   const result = await pool.query(
-    `SELECT u.id,u.email,COALESCE(p.role,u.role,'client') AS role,u.created_at
+    `SELECT u.id,u.email,COALESCE(p.role,u.role,'client') AS role,p.status,u.created_at
      FROM platform_users u LEFT JOIN profiles p ON p.id=u.id WHERE u.id=$1`, [auth.sub],
   );
   return send(res, 200, { data: { user: result.rows[0] || null }, error: null }, headers);
@@ -1499,7 +1500,8 @@ async function initializeDatabase() {
       ]);
       const applied = new Set(migrationRows.map((row) => row.filename));
       if (!applied.size && initializedRows[0]?.initialized) {
-        for (const file of files) {
+        // Legacy snapshots already have the original schema, not future migrations.
+        for (const file of files.filter((name) => /^00[1-9]_|^010_/.test(name))) {
           await pool.query('INSERT INTO platform_schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING', [file]);
           applied.add(file);
         }
@@ -1530,6 +1532,7 @@ async function initializeDatabase() {
 }
 
 await initializeDatabase();
+const handleCommerce = createCommerceHandler({ pool, requireActiveAdmin, jsonBody, send });
 
 http.createServer(async (req, res) => {
   const origin = req.headers.origin || '';
@@ -1539,6 +1542,7 @@ http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
     if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { status: 'ok', service: 'parapente-angola-api' }, headers);
+    if (await handleCommerce(req, res, url, headers)) return;
     if (req.method === 'POST' && url.pathname === '/functions/meteoblue') return await getWeatherForecast(req, res, headers);
     if (req.method === 'GET' && url.pathname === '/events/bookings') return await streamBookingEvents(req, res, headers);
     if (req.method === 'POST' && url.pathname === '/auth/signup') return await signUp(req, res, headers);
@@ -1573,4 +1577,4 @@ http.createServer(async (req, res) => {
     console.error(error);
     return send(res, error.status || 500, { message: error.status ? error.message : 'Internal server error' }, headers);
   }
-}).listen(port, '0.0.0.0', () => console.log(`Parapente Angola API listening on ${port}`));
+}).listen(port, process.env.BIND_HOST || '0.0.0.0', () => console.log(`Parapente Angola API listening on ${port}`));
