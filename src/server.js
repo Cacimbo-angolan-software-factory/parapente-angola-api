@@ -5,6 +5,7 @@ import bcrypt from 'bcryptjs';
 import { SignJWT, jwtVerify } from 'jose';
 import pg from 'pg';
 import { parseIgc } from './igc.js';
+import { examHandler, loadExamBundle } from './examRoutes.js';
 import { managedProfileValues } from './managedProfile.js';
 
 const { Pool } = pg;
@@ -1566,7 +1567,8 @@ async function initializeDatabase() {
       ]);
       const applied = new Set(migrationRows.map((row) => row.filename));
       if (!applied.size && initializedRows[0]?.initialized) {
-        for (const file of files) {
+        // Historical recovery databases already contained migrations 001–010. Apply newer ones normally.
+        for (const file of files.filter(name => name < '011_')) {
           await pool.query('INSERT INTO platform_schema_migrations (filename) VALUES ($1) ON CONFLICT DO NOTHING', [file]);
           applied.add(file);
         }
@@ -1597,6 +1599,8 @@ async function initializeDatabase() {
 }
 
 await initializeDatabase();
+await loadExamBundle(pool, process.env.TRAINING_EXAM_BUNDLE_DIR);
+const handleExams = examHandler({ pool, authenticate, requireActiveAdmin, jsonBody, send });
 
 http.createServer(async (req, res) => {
   const origin = req.headers.origin || '';
@@ -1605,6 +1609,10 @@ http.createServer(async (req, res) => {
   if (origin && !headers['Access-Control-Allow-Origin']) return send(res, 403, { message: 'Origin not allowed' }, headers);
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
+    if (url.pathname.startsWith('/exams/') || url.pathname.startsWith('/admin/exams/')) {
+      headers['Cache-Control'] = 'no-store';
+      return await handleExams(req,res,url.pathname,headers);
+    }
     if (req.method === 'GET' && url.pathname === '/health') return send(res, 200, { status: 'ok', service: 'parapente-angola-api' }, headers);
     if (req.method === 'POST' && url.pathname === '/functions/meteoblue') return await getWeatherForecast(req, res, headers);
     if (req.method === 'GET' && url.pathname === '/events/bookings') return await streamBookingEvents(req, res, headers);
